@@ -1,0 +1,28 @@
+# 忽略 PyCharm 的 IDE 文件夹
+.idea/
+
+# 忽略 Jupyter notebook 检查点
+.ipynb_checkpoints/
+
+# 忽略 Python 缓存文件夹
+__pycache__/
+
+# 忽略结果文件夹（通常生成的结果文件，不进入版本管理）
+results/
+
+# 忽略原始数据文件夹（如不想上传数据，也可选择忽略）
+data_raw/
+
+# 忽略可能产生的日志文件
+*.log
+
+# 忽略临时文件
+*.tmp
+*.temp
+
+# 忽略 Python 编译文件
+*.pyc
+
+# 忽略虚拟环境（如果后续创建虚拟环境）
+venv/
+env/
