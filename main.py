@@ -13,8 +13,8 @@ from data_processing import get_user_item_time
 from recall import itemcf_sim
 from recall import item_based_recommend
 from data_processing import get_item_topk_click
-from evaluation import submit
-from evaluation import calculate_mrr
+from submission import submit
+from submission import calculate_mrr
 
 data_path = './data_raw/'
 save_path = './results/'

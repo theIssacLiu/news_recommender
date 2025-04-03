@@ -1,49 +1,9 @@
-import time
 import numpy as np
 import pandas as pd
-
-# 节约内存的一个标配函数
-def reduce_mem(df):
-    """
-    逐列访问df
-    如果是整形、浮点型，依次找到该列的数据范围
-    尝试转换为尽可能小的、符合数据范围的类型
-    df: 需要节省内存的表格
-    """
-    starttime = time.time()
-    numerics = ['int16', 'int32', 'int64', 'float16', 'float32', 'float64']
-    start_mem = df.memory_usage().sum() / 1024**2
-    for col in df.columns:
-        col_type = df[col].dtypes
-        if col_type in numerics:
-            c_min = df[col].min()
-            c_max = df[col].max()
-            if pd.isnull(c_min) or pd.isnull(c_max):
-                continue
-            if str(col_type)[:3] == 'int':
-                if c_min > np.iinfo(np.int8).min and c_max < np.iinfo(np.int8).max:
-                    df[col] = df[col].astype(np.int8)
-                elif c_min > np.iinfo(np.int16).min and c_max < np.iinfo(np.int16).max:
-                    df[col] = df[col].astype(np.int16)
-                elif c_min > np.iinfo(np.int32).min and c_max < np.iinfo(np.int32).max:
-                    df[col] = df[col].astype(np.int32)
-                elif c_min > np.iinfo(np.int64).min and c_max < np.iinfo(np.int64).max:
-                    df[col] = df[col].astype(np.int64)
-            else:
-                if c_min > np.finfo(np.float16).min and c_max < np.finfo(np.float16).max:
-                    df[col] = df[col].astype(np.float16)
-                elif c_min > np.finfo(np.float32).min and c_max < np.finfo(np.float32).max:
-                    df[col] = df[col].astype(np.float32)
-                else:
-                    df[col] = df[col].astype(np.float64)
-    end_mem = df.memory_usage().sum() / 1024**2
-    print('-- Mem. usage decreased to {:5.2f} Mb ({:.1f}% reduction),time spend:{:2.2f} min'.format(end_mem,
-                                                                                                           100*(start_mem-end_mem)/start_mem,
-                                                                                                           (time.time()-starttime)/60))
-    return df
+import pickle
 
 # debug模式：从训练集中划出一部分数据来调试代码
-def get_all_click_sample(data_path, sample_nums=10000):
+def get_all_click_sample(data_path='./data_raw/', sample_nums=10000):
     """
         训练集中采样一部分数据调试
         data_path: 原数据的存储路径
@@ -75,21 +35,37 @@ def get_all_click_df(data_path='./data_raw/', offline=True):
     return all_click
 
 
-# 根据点击时间获取用户的点击文章序列   {user1: {item1: time1, item2: time2..}...}
-def get_user_item_time(click_df):
-    click_df = click_df.sort_values('click_timestamp')
+# 读取文章的基本属性
+def get_item_info_df(data_path):
+    item_info_df = pd.read_csv(data_path + 'articles.csv')
 
-    def make_item_time_pair(df):
-        return list(zip(df['click_article_id'], df['click_timestamp']))
+    # 为了方便与训练集中的click_article_id拼接，需要把article_id修改成click_article_id
+    item_info_df = item_info_df.rename(columns={'article_id': 'click_article_id'})
 
-    user_item_time_df = click_df.groupby('user_id')[['click_article_id', 'click_timestamp']].apply(
-        lambda x: make_item_time_pair(x)) \
-        .reset_index().rename(columns={0: 'item_time_list'})
-    user_item_time_dict = dict(zip(user_item_time_df['user_id'], user_item_time_df['item_time_list']))
+    return item_info_df
 
-    return user_item_time_dict
 
-# 获取近期点击最多的文章
-def get_item_topk_click(click_df, k):
-    topk_click = click_df['click_article_id'].value_counts().index[:k]
-    return topk_click
+# 读取文章的Embedding数据
+def get_item_emb_dict(data_path, save_path):
+    pkl_path = os.path.join(save_path, 'item_content_emb.pkl')
+
+    # ✅ 如果文件已存在，直接读取返回
+    if os.path.exists(pkl_path):
+        print("🔄 已存在 pkl 文件，直接加载...")
+        with open(pkl_path, 'rb') as f:
+            return pickle.load(f)
+
+    # 否则才计算并保存
+    print("📥 正在读取 CSV 并计算 Embedding...")
+    item_emb_df = pd.read_csv(os.path.join(data_path, 'articles_emb.csv'))
+
+    item_emb_cols = [x for x in item_emb_df.columns if 'emb' in x]
+    item_emb_np = np.ascontiguousarray(item_emb_df[item_emb_cols])
+    item_emb_np = item_emb_np / np.linalg.norm(item_emb_np, axis=1, keepdims=True)
+
+    item_emb_dict = dict(zip(item_emb_df['article_id'], item_emb_np))
+    with open(pkl_path, 'wb') as f:
+        pickle.dump(item_emb_dict, f)
+
+    return item_emb_dict
+
