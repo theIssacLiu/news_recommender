@@ -1,6 +1,7 @@
 import numpy as np
 import pandas as pd
 import pickle
+import os
 
 # debug模式：从训练集中划出一部分数据来调试代码
 def get_all_click_sample(data_path='./data_raw/', sample_nums=10000):
@@ -11,6 +12,8 @@ def get_all_click_sample(data_path='./data_raw/', sample_nums=10000):
     """
     all_click = pd.read_csv(data_path + 'train_click_log.csv')
     all_user_ids = all_click.user_id.unique()
+
+    np.random.seed(42)
 
     sample_user_ids = np.random.choice(all_user_ids, size=sample_nums, replace=False)
     all_click = all_click[all_click['user_id'].isin(sample_user_ids)]
