@@ -75,7 +75,8 @@ def itemcf_sim(df, item_created_time_dict, save_path, use_cache=True):
 
 
 # 基于商品的召回i2i
-def item_based_recommend(user_id, user_item_time_dict, i2i_sim, sim_item_topk, recall_item_num, item_topk_click):
+def item_based_recommend(user_id, user_item_time_dict, i2i_sim, sim_item_topk, recall_item_num, item_topk_click,
+                         item_created_time_dict, emb_i2i_sim):
     """
         基于文章协同过滤的召回
         :param user_id: 用户id
@@ -84,27 +85,38 @@ def item_based_recommend(user_id, user_item_time_dict, i2i_sim, sim_item_topk, r
         :param sim_item_topk: 整数， 选择与当前文章最相似的前k篇文章
         :param recall_item_num: 整数， 最后的召回文章数量
         :param item_topk_click: 列表，点击次数最多的文章列表，用户召回补全
-        return: 召回的文章列表 {item1:score1, item2: score2...}
-        注意: 基于物品的协同过滤(详细请参考上一期推荐系统基础的组队学习)， 在多路召回部分会加上关联规则的召回策略
-    """
+        :param emb_i2i_sim: 字典基于内容embedding算的文章相似矩阵
 
-    # 获取用户历史交互的文章
+        return: 召回的文章列表 {item1:score1, item2: score2...}
+
+    """
+    # 获取用户历史交互的文章，考虑顺位、发布时间、embedding
     user_hist_items = user_item_time_dict[user_id]
 
     item_rank = {}
-    clicked_items = set([i for i, _ in user_hist_items])
     for loc, (i, click_time) in enumerate(user_hist_items):
         for j, wij in sorted(i2i_sim[i].items(), key=lambda x: x[1], reverse=True)[:sim_item_topk]:
-            if j in clicked_items:
+            if j in user_hist_items:
                 continue
 
+            # 文章创建时间差权重
+            created_time_weight = np.exp(0.8 ** np.abs(item_created_time_dict[i] - item_created_time_dict[j]))
+            # 相似文章和历史点击文章序列中历史文章所在的位置权重
+            loc_weight = (0.9 ** (len(user_hist_items) - loc))
+
+            content_weight = 1.0
+            if emb_i2i_sim.get(i, {}).get(j, None) is not None:
+                content_weight += emb_i2i_sim[i][j]
+            if emb_i2i_sim.get(j, {}).get(i, None) is not None:
+                content_weight += emb_i2i_sim[j][i]
+
             item_rank.setdefault(j, 0)
-            item_rank[j] += wij
+            item_rank[j] += created_time_weight * loc_weight * content_weight * wij
 
     # 不足10个，用热门商品补全
     if len(item_rank) < recall_item_num:
         for i, item in enumerate(item_topk_click):
-            if item in item_rank:  # ✅ 判断 item 是否已存在
+            if item in item_rank.items():  # 填充的item应该不在原来的列表中
                 continue
             item_rank[item] = - i - 100  # 随便给个负数就行
             if len(item_rank) == recall_item_num:
@@ -114,40 +126,31 @@ def item_based_recommend(user_id, user_item_time_dict, i2i_sim, sim_item_topk, r
 
     return item_rank
 
-def generate_user_recall_dict(val_df,
-                               user_item_time_dict,
-                               i2i_sim,
-                               sim_item_topk,
-                               recall_item_num,
-                               item_topk_click,
-                               save_path='cache/user_recall_items_default.pkl',
-                               use_cache=True):
+# 使用原始 itemcf 矩阵 + emb 权重融合；
+def generate_itemcf_recall_dict(val_df,
+                                     user_item_time_dict,
+                                     i2i_sim,
+                                     sim_item_topk,
+                                     recall_item_num,
+                                     item_topk_click,
+                                     item_created_time_dict,
+                                     emb_i2i_sim=None,
+                                     save_path='cache/user_recall_itemcf.pkl',
+                                     use_cache=True):
     """
-    生成用户的召回列表，并可自动缓存和复用已有结果
-
-    :param val_df: 验证集（用于获取 user_id 列表）
-    :param user_item_time_dict: 用户-文章点击时间字典
-    :param i2i_sim: 相似度矩阵
-    :param sim_item_topk: 每个历史文章选出的相似文章个数
-    :param recall_item_num: 最终每个用户召回的文章数
-    :param item_topk_click: 热门文章列表（用于召回补全）
-    :param save_path: 召回结果缓存路径或目录
-    :param use_cache: 是否使用已有缓存
-    :return: user_recall_items_dict
+    基于 ItemCF（带 Emb 权重融合）的召回列表生成
     """
-    # 如果是目录，拼接默认文件名
     if os.path.splitext(save_path)[1] == '':
-        save_path = os.path.join(save_path, 'user_recall_items_default.pkl')
+        save_path = os.path.join(save_path, 'user_recall_itemcf.pkl')
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
     if use_cache and os.path.exists(save_path):
-        print(f"[generate_user_recall_dict] ✅ 使用缓存：{save_path}")
+        print(f"[generate_user_recall_dict_itemcf] ✅ 使用缓存：{save_path}")
         with open(save_path, 'rb') as f:
             return pickle.load(f)
 
-    print("[generate_user_recall_dict] 🚀 正在生成用户召回列表...")
-
+    print("[generate_user_recall_dict_itemcf] 🚀 正在生成 ItemCF 召回列表...")
     user_recall_items_dict = {}
     for user in tqdm(val_df['user_id'].unique()):
         rec_items = item_based_recommend(
@@ -156,76 +159,63 @@ def generate_user_recall_dict(val_df,
             i2i_sim,
             sim_item_topk,
             recall_item_num,
-            item_topk_click
+            item_topk_click,
+            item_created_time_dict,
+            emb_i2i_sim
         )
         user_recall_items_dict[user] = rec_items
 
     with open(save_path, 'wb') as f:
         pickle.dump(user_recall_items_dict, f)
 
-    print(f"[generate_user_recall_dict] ✅ 召回列表保存成功：{save_path}")
+    print(f"[generate_user_recall_dict_itemcf] ✅ 召回列表保存成功：{save_path}")
     return user_recall_items_dict
 
-
-# 定义用户活跃度权重
-def get_user_activate_degree_dict(all_click_df):
-    all_click_df_ = all_click_df.groupby('user_id')['click_article_id'].count().reset_index()
-
-    # 用户活跃度归一化
-    mm = MinMaxScaler()
-    all_click_df_['click_article_id'] = mm.fit_transform(all_click_df_[['click_article_id']])
-    user_activate_degree_dict = dict(zip(all_click_df_['user_id'], all_click_df_['click_article_id']))
-
-    return user_activate_degree_dict
-
-# UserCF算法
-def usercf_sim(all_click_df, user_activate_degree_dict, save_path, use_cache=True):
+# 仅使用 embedding 相似度作为召回通道
+def generate_itemcf_embedding_recall_dict(val_df,
+                                         emb_i2i_sim,
+                                         user_item_time_dict,
+                                         sim_item_topk,
+                                         recall_item_num,
+                                         item_topk_click,
+                                         item_created_time_dict=None,
+                                         save_path='cache/user_recall_embedding.pkl',
+                                         use_cache=True):
     """
-    用户相似性矩阵计算 + 缓存机制
-    :param all_click_df: 用户点击日志
-    :param user_activate_degree_dict: 用户活跃度字典
-    :param save_path: 缓存路径（可包含版本名）
-    :param use_cache: 是否使用缓存
-    :return: 用户-用户相似度矩阵 u2u_sim_
+    基于 Embedding 相似度的召回列表生成
     """
-    # === 处理路径 ===
-    if os.path.splitext(save_path)[1] == '':  # 如果是目录则拼接默认文件名
-        save_path = os.path.join(save_path, 'usercf_u2u_sim.pkl')
+    if os.path.splitext(save_path)[1] == '':
+        save_path = os.path.join(save_path, 'user_recall_embedding.pkl')
 
     os.makedirs(os.path.dirname(save_path), exist_ok=True)
 
-    # === 缓存机制 ===
     if use_cache and os.path.exists(save_path):
-        print(f"[usercf_sim] ✅ 使用缓存文件：{save_path}")
+        print(f"[generate_user_recall_dict_embedding] ✅ 使用缓存：{save_path}")
         with open(save_path, 'rb') as f:
             return pickle.load(f)
 
-    print("[usercf_sim] 🚧 正在计算用户相似度矩阵...")
+    print("[generate_user_recall_dict_embedding] 🚀 正在生成 Embedding 召回列表...")
+    user_recall_items_dict = {}
+    for user in tqdm(val_df['user_id'].unique()):
+        rec_items = item_based_recommend(
+            user,
+            user_item_time_dict,
+            emb_i2i_sim,
+            sim_item_topk,
+            recall_item_num,
+            item_topk_click,
+            item_created_time_dict,
+            emb_i2i_sim  # 注意这里传入自身即可，不影响推荐函数中使用权重逻辑
+        )
+        user_recall_items_dict[user] = rec_items
 
-    # === 正式计算 ===
-    item_user_time_dict = get_item_user_time_dict(all_click_df)
-
-    u2u_sim = {}
-    user_cnt = defaultdict(int)
-    for item, user_time_list in tqdm(item_user_time_dict.items()):
-        for u, click_time in user_time_list:
-            user_cnt[u] += 1
-            u2u_sim.setdefault(u, {})
-            for v, click_time in user_time_list:
-                if u == v:
-                    continue
-                u2u_sim[u].setdefault(v, 0)
-                activate_weight = 100 * 0.5 * (user_activate_degree_dict[u] + user_activate_degree_dict[v])
-                u2u_sim[u][v] += activate_weight / math.log(len(user_time_list) + 1)
-
-    u2u_sim_ = u2u_sim.copy()
-    for u, related_users in u2u_sim.items():
-        for v, wij in related_users.items():
-            u2u_sim_[u][v] = wij / math.sqrt(user_cnt[u] * user_cnt[v])
-
-    # === 保存缓存 ===
     with open(save_path, 'wb') as f:
-        pickle.dump(u2u_sim_, f)
-    print(f"[usercf_sim] ✅ 相似度矩阵已保存至：{save_path}")
+        pickle.dump(user_recall_items_dict, f)
 
-    return u2u_sim_
+    print(f"[generate_user_recall_dict_embedding] ✅ 召回列表保存成功：{save_path}")
+    return user_recall_items_dict
+
+
+
+
+

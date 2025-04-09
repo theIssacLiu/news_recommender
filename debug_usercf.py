@@ -3,13 +3,13 @@ from tqdm import tqdm
 
 from data_processing import get_all_click_sample, get_item_info_df
 from utils import get_user_item_time, get_item_topk_click, get_item_info_dict
-from models.itemcf_recall import itemcf_sim, generate_itemcf_recall_dict  # 最新加权召回
+from models.usercf_recall import usercf_sim, generate_usercf_recall_dict, get_user_activate_degree_dict
 from data_processing import embdding_sim
 
 data_path = './data_raw/'
 
-def debug_pipeline(sample_nums=1000, emb_sample_n=500):
-    print("🛠️ Debug 模式启动：当前使用加权 ItemCF + Embedding")
+def debug_usercf_pipeline(sample_nums=1000, emb_sample_n=500):
+    print("🛠️ Debug 模式启动：当前使用 UserCF + Embedding")
 
     # Step 1：采样用户点击数据
     all_click_df = get_all_click_sample(data_path, sample_nums=sample_nums)
@@ -30,26 +30,28 @@ def debug_pipeline(sample_nums=1000, emb_sample_n=500):
     emb_i2i_sim = embdding_sim(click_df_for_emb, item_emb_df, save_path='cache/', topk=10)
     print(f"✅ Step 3：完成 embedding 相似度计算")
 
-    # Step 4：计算 ItemCF 相似度
-    i2i_sim = itemcf_sim(all_click_df, item_created_time_dict, save_path='cache/', use_cache=False)
-    print(f"✅ Step 4：ItemCF 相似度计算完成，共 {len(i2i_sim)} 个物品")
+    # Step 4：计算用户活跃度
+    user_activate_degree_dict = get_user_activate_degree_dict(all_click_df)
+    print(f"✅ Step 4：用户活跃度计算完成，共 {len(user_activate_degree_dict)} 个用户")
 
-    # Step 5：构建召回
+    # Step 5：计算 UserCF 相似度
+    u2u_sim = usercf_sim(all_click_df, user_activate_degree_dict, save_path='cache/', use_cache=False)
+    print(f"✅ Step 5：UserCF 相似度计算完成，共 {len(u2u_sim)} 个用户")
+
+    # Step 6：构建召回
     val_df = pd.DataFrame({'user_id': all_click_df['user_id'].unique()[:5]})
     user_item_time_dict = get_user_item_time(all_click_df)
     item_topk_click = get_item_topk_click(all_click_df, k=50)
 
-    user_recall_items_dict = generate_itemcf_recall_dict(
-        val_df=val_df,
+    user_recall_items_dict = generate_usercf_recall_dict(
+        click_df=val_df,
         user_item_time_dict=user_item_time_dict,
-        i2i_sim=i2i_sim,
-        sim_item_topk=10,
+        u2u_sim=u2u_sim,
+        sim_user_topk=10,
         recall_item_num=10,
         item_topk_click=item_topk_click,
         item_created_time_dict=item_created_time_dict,
-        emb_i2i_sim=emb_i2i_sim,
-        save_path='cache/user_recall_debug.pkl',
-        use_cache=False
+        emb_i2i_sim=emb_i2i_sim
     )
 
     for user, rec_list in user_recall_items_dict.items():
@@ -57,9 +59,8 @@ def debug_pipeline(sample_nums=1000, emb_sample_n=500):
         for item, score in rec_list:
             print(f"  📄 文章 {item}, 相似度得分 {score:.4f}")
 
-    print("\n🎉 Debug 流程完成 ✅")
-
+    print("\n🎉 UserCF Debug 流程完成 ✅")
 
 
 if __name__ == '__main__':
-    debug_pipeline(sample_nums=1000)
+    debug_usercf_pipeline(sample_nums=1000) 

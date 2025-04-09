@@ -65,7 +65,7 @@ def get_item_user_time_dict(click_df):
         return list(zip(df['user_id'], df['click_timestamp']))
 
     click_df = click_df.sort_values('click_timestamp')
-    item_user_time_df = click_df.groupby('click_article_id')['user_id', 'click_timestamp'].apply(
+    item_user_time_df = click_df.groupby('click_article_id')[['user_id', 'click_timestamp']].apply(
         lambda x: make_user_time_pair(x)) \
         .reset_index().rename(columns={0: 'user_time_list'})
 
