@@ -90,13 +90,17 @@ def item_based_recommend(user_id, user_item_time_dict, i2i_sim, sim_item_topk, r
         return: 召回的文章列表 {item1:score1, item2: score2...}
 
     """
-    # 获取用户历史交互的文章，考虑顺位、发布时间、embedding
+    # 获取用户历史交互的文章
     user_hist_items = user_item_time_dict[user_id]
+    
+    # 提取用户历史交互的物品ID，转为集合以加速查找
+    hist_item_ids = set([x[0] for x in user_hist_items])
 
     item_rank = {}
     for loc, (i, click_time) in enumerate(user_hist_items):
         for j, wij in sorted(i2i_sim[i].items(), key=lambda x: x[1], reverse=True)[:sim_item_topk]:
-            if j in user_hist_items:
+            # 检查j是否在用户历史交互物品中
+            if j in hist_item_ids:
                 continue
 
             # 文章创建时间差权重
@@ -116,7 +120,7 @@ def item_based_recommend(user_id, user_item_time_dict, i2i_sim, sim_item_topk, r
     # 不足10个，用热门商品补全
     if len(item_rank) < recall_item_num:
         for i, item in enumerate(item_topk_click):
-            if item in item_rank.items():  # 填充的item应该不在原来的列表中
+            if item in item_rank:  # 填充的item应该不在原来的列表中
                 continue
             item_rank[item] = - i - 100  # 随便给个负数就行
             if len(item_rank) == recall_item_num:

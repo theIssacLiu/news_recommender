@@ -6,6 +6,9 @@ import pickle
 import os
 from sklearn.preprocessing import MinMaxScaler
 from utils import get_item_user_time_dict
+import collections
+import faiss
+import torch
 
 
 # 定义用户活跃度权重
@@ -80,19 +83,20 @@ def usercf_sim(all_click_df, user_activate_degree_dict, save_path, use_cache=Tru
 # 基于用户的召回 u2u2i
 def user_based_recommend(user_id, user_item_time_dict, u2u_sim, sim_user_topk, recall_item_num,
                          item_topk_click, item_created_time_dict, emb_i2i_sim):
-    """
-        基于文章协同过滤的召回
-        :param user_id: 用户id
-        :param user_item_time_dict: 字典, 根据点击时间获取用户的点击文章序列   {user1: {item1: time1, item2: time2..}...}
-        :param u2u_sim: 字典，文章相似性矩阵
-        :param sim_user_topk: 整数， 选择与当前用户最相似的前k个用户
-        :param recall_item_num: 整数， 最后的召回文章数量
-        :param item_topk_click: 列表，点击次数最多的文章列表，用户召回补全
-        :param item_created_time_dict: 文章创建时间列表
-        :param emb_i2i_sim: 字典基于内容embedding算的文章相似矩阵
-
-        return: 召回的文章列表 {item1:score1, item2: score2...}
-    """
+    """基于用户的召回"""
+    
+    # 修改警告输出方式
+    if user_id not in u2u_sim:
+        if user_id % 1000 == 0:  # 每1000个用户才输出一次
+            print(f"⚠️ 用户ID {user_id} 不在相似度矩阵中 (仅显示每1000个)")
+        # 返回热门物品作为后备方案
+        return [(item, -i-100) for i, item in enumerate(item_topk_click[:recall_item_num])]
+    
+    if user_id not in user_item_time_dict:
+        print(f"⚠️ 用户 {user_id} 没有历史交互记录")
+        # 返回热门物品作为后备方案
+        return [(item, -i-100) for i, item in enumerate(item_topk_click[:recall_item_num])]
+    
     # 历史交互
     user_item_time_list = user_item_time_dict[user_id]  # {item1: time1, item2: time2...}
     user_hist_items = set([i for i, t in user_item_time_list])  # 存在一个用户与某篇文章的多次交互， 这里得去重
@@ -126,9 +130,9 @@ def user_based_recommend(user_id, user_item_time_dict, u2u_sim, sim_user_topk, r
     # 热度补全
     if len(items_rank) < recall_item_num:
         for i, item in enumerate(item_topk_click):
-            if item in items_rank.items():  # 填充的item应该不在原来的列表中
+            if item in items_rank:  # 修正：检查是否已在字典中，而不是检查是否在字典的items()中
                 continue
-            items_rank[item] = - i - 100  # 随便给个复数就行
+            items_rank[item] = - i - 100  # 随便给个负数就行
             if len(items_rank) == recall_item_num:
                 break
 
@@ -139,13 +143,74 @@ def user_based_recommend(user_id, user_item_time_dict, u2u_sim, sim_user_topk, r
 # ============================
 # ✅ UserCF相似度计算（传统相似用户）
 # ============================
-def generate_usercf_recall_dict(click_df, user_item_time_dict, u2u_sim, sim_user_topk, recall_item_num,
-                  item_topk_click, item_created_time_dict, emb_i2i_sim):
+def generate_usercf_recall_dict(click_df, user_item_time_dict, u2u_sim, sim_user_topk,
+                              recall_item_num, item_topk_click, item_created_time_dict, 
+                              emb_i2i_sim, save_path='./cache/', use_cache=True):
+    """生成基于用户的召回结果"""
+    
+    # 添加缓存路径
+    cache_path = os.path.join(save_path, 'usercf_recall_dict.pkl')
+    
+    # 检查缓存
+    if use_cache and os.path.exists(cache_path):
+        print(f"[generate_usercf_recall_dict] ✅ 使用缓存：{cache_path}")
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    
     user_recall_items_dict = {}
-    for user in tqdm(click_df['user_id'].unique()):
-        rec_items = user_based_recommend(user, user_item_time_dict, u2u_sim, sim_user_topk,
-                                         recall_item_num, item_topk_click, item_created_time_dict, emb_i2i_sim)
-        user_recall_items_dict[user] = rec_items
+    
+    print("生成用户召回结果...")
+    total_users = len(click_df['user_id'].unique())
+    missing_users = 0
+    
+    for user_id in tqdm(click_df['user_id'].unique()):
+        user_recall_items_dict[user_id] = []
+        
+        # 如果用户不在相似度矩阵中，记录并跳过
+        if user_id not in u2u_sim:
+            missing_users += 1
+            continue
+            
+        # 获取相似用户及其相似度
+        sim_users = u2u_sim[user_id]
+        
+        item_rank = {}
+        for sim_user, sim_score in sim_users:
+            # 获取相似用户的历史交互
+            if sim_user not in user_item_time_dict:
+                continue
+                
+            sim_user_items = user_item_time_dict[sim_user]
+            for item_id, _ in sim_user_items:
+                if item_id in item_rank:
+                    continue
+                    
+                item_rank[item_id] = sim_score
+                
+        # 按照得分排序，取前N个
+        item_rank_tuple = sorted(item_rank.items(), key=lambda x: x[1], reverse=True)[:recall_item_num]
+        
+        # 如果召回数量不足，用热门物品补充
+        if len(item_rank_tuple) < recall_item_num:
+            for i, item in enumerate(item_topk_click):
+                if item not in dict(item_rank_tuple):
+                    item_rank_tuple.append((item, -i-100))
+                if len(item_rank_tuple) >= recall_item_num:
+                    break
+                    
+        user_recall_items_dict[user_id] = item_rank_tuple
+    
+    # 打印相似度矩阵覆盖率统计
+    coverage = (total_users - missing_users) / total_users
+    print(f"\n[generate_usercf_recall_dict] 用户相似度矩阵覆盖率: {coverage:.4f}")
+    print(f"总用户数: {total_users}, 缺失用户数: {missing_users}")
+    
+    # 保存结果
+    os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+    with open(cache_path, 'wb') as f:
+        pickle.dump(user_recall_items_dict, f)
+    print(f"[generate_usercf_recall_dict] ✅ 召回结果已保存至: {cache_path}")
+    
     return user_recall_items_dict
 
 
@@ -177,3 +242,80 @@ def generate_ucercf_embedding_recall_dict(click_df, user_emb_dict, save_path, to
         pickle.dump(user_sim_dict, f)
 
     return user_sim_dict
+
+# 使用Embedding的方式获取u2u的相似性矩阵
+def u2u_embedding_sim(click_df, user_emb_dict, save_path='./cache/', topk=20, use_cache=True):
+    """
+    基于用户嵌入计算用户相似度
+    """
+    cache_path = save_path if save_path.endswith('.pkl') else os.path.join(save_path, 'youtube_u2u_sim.pkl')
+    
+    if use_cache and os.path.exists(cache_path):
+        print(f"[u2u_embedding_sim] ✅ 加载用户相似度缓存: {cache_path}")
+        with open(cache_path, 'rb') as f:
+            u2u_sim = pickle.load(f)
+    else:
+        print("[u2u_embedding_sim] 计算用户相似度矩阵...")
+        
+        # 检查用户嵌入是否为空
+        if not user_emb_dict:
+            print("[u2u_embedding_sim] ⚠️ 用户嵌入字典为空！")
+            return {}
+            
+        # 获取所有用户ID和对应的嵌入
+        print(f"[u2u_embedding_sim] 用户嵌入数量: {len(user_emb_dict)}")
+        
+        # 转换嵌入格式
+        all_user_ids = []
+        user_embeddings = []
+        for user_id, emb in user_emb_dict.items():
+            # 确保嵌入是一维数组
+            if isinstance(emb, torch.Tensor):
+                emb = emb.detach().cpu().numpy()
+            if len(emb.shape) > 1:
+                emb = emb.squeeze()
+            
+            all_user_ids.append(user_id)
+            user_embeddings.append(emb)
+        
+        user_embeddings = np.array(user_embeddings, dtype=np.float32)
+        print(f"[u2u_embedding_sim] 嵌入矩阵形状: {user_embeddings.shape}")
+        
+        # 归一化嵌入
+        norms = np.linalg.norm(user_embeddings, axis=1, keepdims=True)
+        user_embeddings = user_embeddings / norms
+        
+        # 使用Faiss进行快速相似度计算
+        dim = user_embeddings.shape[1]
+        index = faiss.IndexFlatIP(dim)
+        index.add(user_embeddings)
+        
+        # 计算相似度
+        sim_scores, sim_idx = index.search(user_embeddings, topk + 1)
+        
+        # 构建用户相似度字典
+        u2u_sim = {}
+        for i, user_id in enumerate(all_user_ids):
+            # 跳过第一个（自己）
+            similar_users = [(all_user_ids[idx], float(score)) 
+                           for idx, score in zip(sim_idx[i][1:], sim_scores[i][1:])]
+            u2u_sim[user_id] = similar_users
+        
+        print(f"[u2u_embedding_sim] 计算完成，用户数: {len(u2u_sim)}")
+        
+        # 保存结果
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, 'wb') as f:
+            pickle.dump(u2u_sim, f)
+    
+    # 打印一些统计信息
+    print(f"[u2u_embedding_sim] 相似度矩阵中的用户数: {len(u2u_sim)}")
+    if len(u2u_sim) > 0:
+        sample_user = next(iter(u2u_sim))
+        print(f"[u2u_embedding_sim] 样例 - 用户{sample_user}的相似用户数: {len(u2u_sim[sample_user])}")
+        # 打印一些样例相似度
+        print("\n相似度样例:")
+        for sim_user, sim_score in u2u_sim[sample_user][:3]:
+            print(f"用户{sample_user} -> 用户{sim_user}: {sim_score:.4f}")
+    
+    return u2u_sim

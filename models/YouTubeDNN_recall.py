@@ -1,6 +1,153 @@
 import numpy as np
+import pandas as pd
 from tqdm import tqdm
 import pickle
+import os
+import random
+import collections
+import faiss
+from sklearn.preprocessing import LabelEncoder
+from tensorflow.keras.preprocessing.sequence import pad_sequences
+from tensorflow.keras.models import Model
+from tensorflow.keras.layers import Input, Embedding, Dense, Dropout, Flatten, Concatenate, Layer
+from tensorflow.keras import regularizers
+import tensorflow as tf
+
+# 定义特征列类
+class SparseFeat(object):
+    def __init__(self, name, vocabulary_size, embedding_dim=8, use_hash=False, dtype='int32', embedding_name=None):
+        self.name = name
+        self.vocabulary_size = vocabulary_size
+        self.embedding_dim = embedding_dim
+        self.use_hash = use_hash
+        self.dtype = dtype
+        self.embedding_name = embedding_name if embedding_name else name
+
+class VarLenSparseFeat(object):
+    def __init__(self, sparsefeat, maxlen, combiner='mean', length_name=None):
+        self.sparsefeat = sparsefeat
+        self.maxlen = maxlen
+        self.combiner = combiner
+        self.length_name = length_name
+
+# 定义Sampled Softmax Loss
+def sampledsoftmaxloss(y_true, y_pred):
+    return y_pred
+
+# YouTubeDNN模型定义
+class YoutubeDNN(Model):
+    def __init__(self, user_feature_columns, item_feature_columns, user_dnn_hidden_units=(64, 32), 
+                 dnn_activation='relu', dnn_use_bias=True, dnn_dropout=0, num_sampled=5, seed=1024, **kwargs):
+        super(YoutubeDNN, self).__init__(**kwargs)
+        
+        self.user_feature_columns = user_feature_columns
+        self.item_feature_columns = item_feature_columns
+        self.hidden_units = user_dnn_hidden_units
+        self.activation = dnn_activation
+        self.use_bias = dnn_use_bias
+        self.dropout = dnn_dropout
+        self.num_sampled = num_sampled
+        self.seed = seed
+        
+        # 创建用户嵌入字典
+        self.user_embedding_dict = {}
+        self.history_feature_list = []
+        
+        for feat in self.user_feature_columns:
+            if isinstance(feat, SparseFeat):
+                self.user_embedding_dict[feat.embedding_name] = Embedding(
+                    input_dim=feat.vocabulary_size,
+                    output_dim=feat.embedding_dim,
+                    embeddings_initializer='random_normal',
+                    embeddings_regularizer=regularizers.l2(1e-6),
+                    name='emb_' + feat.name)
+            elif isinstance(feat, VarLenSparseFeat):
+                self.user_embedding_dict[feat.sparsefeat.embedding_name] = Embedding(
+                    input_dim=feat.sparsefeat.vocabulary_size,
+                    output_dim=feat.sparsefeat.embedding_dim,
+                    embeddings_initializer='random_normal',
+                    embeddings_regularizer=regularizers.l2(1e-6),
+                    name='emb_' + feat.sparsefeat.name,
+                    mask_zero=True)
+                self.history_feature_list.append(feat.name)
+        
+        # 创建物品嵌入字典
+        self.item_embedding_dict = {}
+        for feat in self.item_feature_columns:
+            if isinstance(feat, SparseFeat):
+                self.item_embedding_dict[feat.embedding_name] = Embedding(
+                    input_dim=feat.vocabulary_size,
+                    output_dim=feat.embedding_dim,
+                    embeddings_initializer='random_normal',
+                    embeddings_regularizer=regularizers.l2(1e-6),
+                    name='emb_' + feat.name)
+        
+        # 用户塔DNN层
+        self.user_dnn_layers = []
+        for unit in self.hidden_units:
+            self.user_dnn_layers.append(Dense(unit, activation=self.activation))
+            self.user_dnn_layers.append(Dropout(self.dropout))
+        
+        # 输出层
+        self.output_layer = Dense(1, use_bias=False)
+    
+    def call(self, inputs, training=None):
+        # 用户特征处理
+        user_embeddings = []
+        sparse_embedding_list = []
+        seq_embedding_list = []
+        
+        for feat in self.user_feature_columns:
+            if isinstance(feat, SparseFeat):
+                user_embedding = self.user_embedding_dict[feat.embedding_name](inputs[feat.name])
+                user_embeddings.append(user_embedding)
+            elif isinstance(feat, VarLenSparseFeat):
+                seq_embedding = self.user_embedding_dict[feat.sparsefeat.embedding_name](inputs[feat.name])
+                # 计算序列特征的平均值
+                hist_len = inputs[feat.length_name]
+                mask = tf.sequence_mask(hist_len, feat.maxlen)
+                mask = tf.cast(mask, tf.float32)
+                mask = tf.expand_dims(mask, axis=-1)
+                # 长度归一化
+                seq_embedding = seq_embedding * mask
+                hist_len = tf.cast(hist_len, tf.float32)
+                hist_len = tf.expand_dims(hist_len, axis=-1)
+                seq_embedding = tf.reduce_sum(seq_embedding, axis=1) / tf.maximum(hist_len, 1.0)
+                user_embeddings.append(seq_embedding)
+        
+        # 物品特征处理
+        item_embeddings = []
+        for feat in self.item_feature_columns:
+            if isinstance(feat, SparseFeat):
+                item_embedding = self.item_embedding_dict[feat.embedding_name](inputs[feat.name])
+                item_embeddings.append(item_embedding)
+        
+        # 处理用户特征向量
+        user_embedding = tf.concat(user_embeddings, axis=-1)
+        for layer in self.user_dnn_layers:
+            user_embedding = layer(user_embedding)
+        self.user_embedding = user_embedding
+        
+        # 处理物品特征向量
+        item_embedding = tf.concat(item_embeddings, axis=-1)
+        self.item_embedding = item_embedding
+        
+        # 模型输出
+        output = tf.matmul(user_embedding, item_embedding, transpose_b=True)
+        self.logits = output
+        
+        return output
+    
+    def summary(self):
+        user_inputs = {feat.name: Input(shape=(1,) if isinstance(feat, SparseFeat) else (feat.maxlen,), name=feat.name) 
+                      for feat in self.user_feature_columns}
+        item_inputs = {feat.name: Input(shape=(1,), name=feat.name) for feat in self.item_feature_columns}
+        
+        all_inputs = {**user_inputs, **item_inputs}
+        self.user_input = all_inputs
+        self.item_input = item_inputs
+        
+        Model(inputs=all_inputs, outputs=self.call(all_inputs)).summary()
 
 # 获取双塔召回时的训练验证数据
 # negsample指的是通过滑窗构建样本的时候，负样本的数量
@@ -57,7 +204,33 @@ def gen_model_input(train_set, user_profile, seq_max_len):
     return train_model_input, train_label
 
 
-def youtubednn_u2i_dict(data, topk=20):
+def youtubednn_u2i_dict(data, save_path="./cache/", topk=20, epochs=5, batch_size=256, validation_split=0.1):
+    """
+    训练YouTubeDNN模型并生成用户-物品召回表
+    
+    Args:
+        data: 用户点击数据，包含user_id、click_article_id和click_timestamp列
+        save_path: 结果保存路径
+        topk: 为每个用户召回物品的数量
+        epochs: 训练轮数
+        batch_size: 批大小
+        validation_split: 验证集比例
+        
+    Returns:
+        用户-物品召回表，格式为{用户ID: [(物品ID, 得分), ...]}
+    """
+    # 确保路径存在
+    os.makedirs(save_path, exist_ok=True)
+    
+    # 如果存在缓存直接读取
+    cache_path = os.path.join(save_path, 'youtube_u2i_dict.pkl')
+    if os.path.exists(cache_path):
+        print(f"[youtubednn_u2i_dict] ✅ 使用缓存：{cache_path}")
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
+    
+    print("[youtubednn_u2i_dict] 🚀 开始训练YouTubeDNN模型...")
+    
     sparse_features = ["click_article_id", "user_id"]
     SEQ_LEN = 30  # 用户点击序列的长度，短的填充，长的截断
 
@@ -82,7 +255,9 @@ def youtubednn_u2i_dict(data, topk=20):
 
     # 划分训练和测试集
     # 由于深度学习需要的数据量通常都是非常大的，所以为了保证召回的效果，往往会通过滑窗的形式扩充训练样本
-    train_set, test_set = gen_data_set(data, 0)
+    train_set, test_set = gen_data_set(data, negsample=4)  # 添加负样本
+    print(f"[youtubednn_u2i_dict] 训练集样本数：{len(train_set)}，测试集样本数：{len(test_set)}")
+    
     # 整理输入数据，具体的操作可以看上面的函数
     train_model_input, train_label = gen_model_input(train_set, user_profile, SEQ_LEN)
     test_model_input, test_label = gen_model_input(test_set, user_profile, SEQ_LEN)
@@ -103,10 +278,17 @@ def youtubednn_u2i_dict(data, topk=20):
                        user_dnn_hidden_units=(64, embedding_dim))
     # 模型编译
     model.compile(optimizer="adam", loss=sampledsoftmaxloss)
+    model.summary()
 
+    print(f"[youtubednn_u2i_dict] 开始训练，epochs={epochs}, batch_size={batch_size}")
     # 模型训练，这里可以定义验证集的比例，如果设置为0的话就是全量数据直接进行训练
-    history = model.fit(train_model_input, train_label, batch_size=256, epochs=1, verbose=1, validation_split=0.0)
+    history = model.fit(train_model_input, train_label, 
+                       batch_size=batch_size, 
+                       epochs=epochs, 
+                       verbose=1, 
+                       validation_split=validation_split)
 
+    print("[youtubednn_u2i_dict] 训练完成，提取Embedding...")
     # 训练完模型之后,提取训练的Embedding，包括user端和item端
     test_user_model_input = test_model_input
     all_item_model_input = {"click_article_id": item_profile['click_article_id'].values}
@@ -128,9 +310,10 @@ def youtubednn_u2i_dict(data, topk=20):
     raw_item_id_emb_dict = {item_index_2_rawid[k]: \
                                 v for k, v in zip(item_profile['click_article_id'], item_embs)}
     # 将Embedding保存到本地
-    pickle.dump(raw_user_id_emb_dict, open(save_path + 'user_youtube_emb.pkl', 'wb'))
-    pickle.dump(raw_item_id_emb_dict, open(save_path + 'item_youtube_emb.pkl', 'wb'))
+    pickle.dump(raw_user_id_emb_dict, open(os.path.join(save_path, 'user_youtube_emb.pkl'), 'wb'))
+    pickle.dump(raw_item_id_emb_dict, open(os.path.join(save_path, 'item_youtube_emb.pkl'), 'wb'))
 
+    print("[youtubednn_u2i_dict] 使用Faiss进行向量检索...")
     # faiss紧邻搜索，通过user_embedding 搜索与其相似性最高的topk个item
     index = faiss.IndexFlatIP(embedding_dim)
     # 上面已经进行了归一化，这里可以不进行归一化了
@@ -155,5 +338,7 @@ def youtubednn_u2i_dict(data, topk=20):
     # 保存召回的结果
     # 这里是直接通过向量的方式得到了召回结果，相比于上面的召回方法，上面的只是得到了i2i及u2u的相似性矩阵，还需要进行协同过滤召回才能得到召回结果
     # 可以直接对这个召回结果进行评估，为了方便可以统一写一个评估函数对所有的召回结果进行评估
-    pickle.dump(user_recall_items_dict, open(save_path + 'youtube_u2i_dict.pkl', 'wb'))
+    pickle.dump(user_recall_items_dict, open(os.path.join(save_path, 'youtube_u2i_dict.pkl'), 'wb'))
+    print(f"[youtubednn_u2i_dict] ✅ YouTubeDNN召回结果已保存至：{os.path.join(save_path, 'youtube_u2i_dict.pkl')}")
+    
     return user_recall_items_dict
