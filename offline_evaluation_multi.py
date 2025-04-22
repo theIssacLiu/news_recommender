@@ -138,7 +138,7 @@ def combine_recall_results(user_multi_recall_dict, weight_dict=None, topk=25, sa
 
     return final_recall_items_dict_rank
 
-def get_youtube_recall(train_df, val_df, save_path, use_cache=True, epochs=2, batch_size=256, embedding_dim=16, recall_num=50):
+def get_youtube_recall(train_df, val_df, save_path, use_cache=False, epochs=10, batch_size=64, embedding_dim=64, recall_num=50):
     """
     使用PyTorch版本的YouTubeDNN模型生成用户-物品召回表
     
@@ -326,7 +326,7 @@ def metrics_recall_at_k(user_recall_items_dict, val_df, k):
     recall = round(hit / len(covered_users), 5) if covered_users else 0
     return recall
 
-def offline_evaluate_multi(use_cache=True, recall_num=50):
+def offline_evaluate_multi(use_cache=True, recall_num=50, epochs=10, batch_size=32, embedding_dim=32):
     print(f"\n📂 当前使用的缓存目录: {cache_dir}")
     
     # 检查现有缓存文件
@@ -384,9 +384,9 @@ def offline_evaluate_multi(use_cache=True, recall_num=50):
         data=all_df,
         save_path=cache_dir,
         topk=recall_num,
-        epochs=10,
-        batch_size=128,
-        embedding_dim=32
+        epochs=epochs,
+        batch_size=batch_size,
+        embedding_dim=embedding_dim
     )
     
     # 然后加载生成的用户嵌入
@@ -552,12 +552,21 @@ def offline_evaluate_multi(use_cache=True, recall_num=50):
 
 if __name__ == '__main__':
     # 配置参数
-    use_cache = True  # 使用缓存
+    use_cache = False  # 强制重新训练
     recall_num = 50   # 召回数量
+    epochs = 20        # 增加训练轮数
+    batch_size = 128   # 增加批次大小
+    embedding_dim = 64  # 增加嵌入维度
     
     # 检查设备
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"使用设备: {device}")
     
     # 运行多源召回评估
-    results = offline_evaluate_multi(use_cache=use_cache, recall_num=recall_num) 
+    results = offline_evaluate_multi(
+        use_cache=use_cache,  # 强制重新训练
+        recall_num=recall_num,
+        epochs=epochs,        # 增加训练轮数
+        batch_size=batch_size,   # 增加批次大小
+        embedding_dim=embedding_dim  # 增加嵌入维度
+    ) 

@@ -130,125 +130,190 @@ class YouTubeDNNModel(nn.Module):
 
 # 获取双塔召回时的训练验证数据
 # negsample指的是通过滑窗构建样本的时候，负样本的数量
-def gen_data_set(data, negsample=0, max_hist_len=30):
+def gen_data_set(data, negsample=0, max_hist_len=30, cache_path=None, use_cache=True):
     """
-    生成训练集和测试集
+    生成训练集和测试集，支持缓存
+    """
+    # 如果启用缓存且缓存文件存在，直接加载
+    if use_cache and cache_path and os.path.exists(cache_path):
+        print(f"✅ 从缓存加载训练集和测试集: {cache_path}")
+        with open(cache_path, 'rb') as f:
+            return pickle.load(f)
     
-    Args:
-        data: 用户点击数据
-        negsample: 每个正样本对应的负样本数量
-        max_hist_len: 历史序列的最大长度
-        
-    Returns:
-        训练集和测试集的元组
-    """
+    print("🚀 开始生成训练集和测试集...")
     data.sort_values("click_timestamp", inplace=True)
-    item_ids = data['click_article_id'].unique()
-
+    
+    # 获取编码后的物品ID范围
+    item_ids = data['click_article_id_encoded'].unique()
+    max_item_id = item_ids.max()
+    print(f"编码后物品ID范围: 0-{max_item_id}")
+    
     train_set = []
     test_set = []
-    for reviewerID, hist in tqdm(data.groupby('user_id')):
-        pos_list = hist['click_article_id'].tolist()
-
+    
+    # 使用tqdm显示进度
+    for reviewerID, hist in tqdm(data.groupby('user_id_encoded'), desc="构建训练样本"):
+        pos_list = hist['click_article_id_encoded'].tolist()
+        
         if negsample > 0:
-            candidate_set = list(set(item_ids) - set(pos_list))  # 用户没看过的文章里面选择负样本
-            neg_list = np.random.choice(candidate_set, size=len(pos_list) * negsample, replace=True)  # 对于每个正样本，选择n个负样本
+            # 修改负采样逻辑，确保采样的ID在有效范围内
+            valid_item_ids = item_ids[item_ids < max_item_id + 1]
+            candidate_set = list(set(valid_item_ids) - set(pos_list))
+            
+            if len(candidate_set) < negsample:
+                # 如果候选集太小，允许重复采样
+                neg_list = np.random.choice(candidate_set, size=len(pos_list) * negsample, replace=True)
+            else:
+                # 否则不允许重复采样
+                neg_list = np.random.choice(candidate_set, size=len(pos_list) * negsample, replace=False)
 
-        # 长度只有一个的时候，需要把这条数据也放到训练集中，不然的话最终学到的embedding就会有缺失
         if len(pos_list) == 1:
             train_set.append((reviewerID, [pos_list[0]], pos_list[0], 1, 1))
             test_set.append((reviewerID, [pos_list[0]], pos_list[0], 1, 1))
             continue
 
-        # 滑窗构造正负样本
         for i in range(1, len(pos_list)):
             hist = pos_list[:i]
-            # 限制历史序列的最大长度
             hist = hist[-max_hist_len:] if len(hist) > max_hist_len else hist
 
             if i != len(pos_list) - 1:
-                train_set.append((reviewerID, hist[::-1], pos_list[i], 1,
-                                  len(hist[::-1])))  # 正样本 [user_id, his_item, pos_item, label, len(his_item)]
+                train_set.append((reviewerID, hist[::-1], pos_list[i], 1, len(hist[::-1])))
                 for negi in range(negsample):
-                    train_set.append((reviewerID, hist[::-1], neg_list[i * negsample + negi], 0,
-                                      len(hist[::-1])))  # 负样本 [user_id, his_item, neg_item, label, len(his_item)]
+                    neg_item = neg_list[i * negsample + negi]
+                    train_set.append((reviewerID, hist[::-1], neg_item, 0, len(hist[::-1])))
             else:
-                # 将最长的那一个序列长度作为测试数据
                 test_set.append((reviewerID, hist[::-1], pos_list[i], 1, len(hist[::-1])))
 
+    # 打乱数据
     random.shuffle(train_set)
     random.shuffle(test_set)
-
+    
+    # 验证生成的数据集
+    print("验证数据集...")
+    max_user_id = data['user_id_encoded'].max()
+    max_item_id = data['click_article_id_encoded'].max()
+    
+    for sample in train_set + test_set:
+        user_id, hist_items, target_item, label, seq_len = sample
+        assert user_id <= max_user_id, f"用户ID {user_id} 超出范围 {max_user_id}"
+        assert target_item <= max_item_id, f"物品ID {target_item} 超出范围 {max_item_id}"
+        assert all(item <= max_item_id for item in hist_items), f"历史物品列表包含超出范围的ID"
+    
+    print(f"✅ 数据集验证通过")
+    print(f"训练集大小: {len(train_set)}")
+    print(f"测试集大小: {len(test_set)}")
+    
+    # 如果指定了缓存路径，保存结果
+    if cache_path:
+        print(f"💾 保存训练集和测试集到缓存: {cache_path}")
+        os.makedirs(os.path.dirname(cache_path), exist_ok=True)
+        with open(cache_path, 'wb') as f:
+            pickle.dump((train_set, test_set), f)
+    
     return train_set, test_set
 
 
 def train_youtube_dnn(train_dataloader, test_dataloader, model, device, epochs=5, 
-                      learning_rate=0.001, weight_decay=1e-6):
+                     learning_rate=0.001, weight_decay=1e-6):
     """
-    训练YouTubeDNN模型
+    训练YouTubeDNN模型，添加错误处理和数据验证
     """
-    # 定义损失函数和优化器
-    criterion = nn.BCEWithLogitsLoss()
-    optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
-
-    # 将模型移动到设备
-    model.to(device)
-    model.train()
+    print(f"[train_youtube_dnn] 开始训练，设备: {device}")
     
-    print(f"[train_youtube_dnn] 模型已加载到设备: {device}")
-    print(f"[train_youtube_dnn] 开始训练 {epochs} 轮...")
+    # 1. 设置CUDA环境变量，帮助调试
+    os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
     
     try:
+        # 2. 确保模型和数据在同一设备上
+        model = model.to(device)
+        
+        # 3. 使用混合精度训练
+        scaler = torch.cuda.amp.GradScaler()
+        
+        # 定义损失函数和优化器
+        criterion = nn.BCEWithLogitsLoss()
+        optimizer = optim.Adam(model.parameters(), lr=learning_rate, weight_decay=weight_decay)
+        
+        # 记录最佳验证损失，用于保存最佳模型
+        best_val_loss = float('inf')
+        best_model_state = None
+        
         for epoch in range(epochs):
+            # 训练阶段
+            model.train()
             train_loss = 0.0
             train_batches = 0
             
-            # 训练循环
             for batch_idx, batch in enumerate(tqdm(train_dataloader, desc=f'Epoch {epoch+1}/{epochs}')):
                 try:
-                    user_id = batch['user_id'].to(device)
-                    hist_item_seq = batch['hist_item_seq'].to(device)
-                    target_item = batch['target_item'].to(device)
-                    seq_len = batch['seq_len'].to(device)
-                    label = batch['label'].float().to(device)
+                    # 4. 在移动数据到GPU前先验证数据
+                    user_id = batch['user_id'].long()
+                    hist_item_seq = batch['hist_item_seq'].long()
+                    target_item = batch['target_item'].long()
+                    seq_len = batch['seq_len'].long()
+                    label = batch['label'].float()
                     
-                    # 前向传播
-                    scores = model(user_id, hist_item_seq, target_item, seq_len)
-                    loss = criterion(scores, label)
+                    # 打印详细的调试信息
+                    if batch_idx == 0:
+                        print(f"用户ID范围: {user_id.min()}-{user_id.max()}, 嵌入层范围: {model.user_embedding.num_embeddings}")
+                        print(f"物品ID范围: {hist_item_seq.max()}, 嵌入层范围: {model.item_embedding.num_embeddings}")
                     
-                    # 反向传播和优化
+                    # 严格的范围检查
+                    if user_id.max() >= model.user_embedding.num_embeddings:
+                        print(f"警告：用户ID {user_id.max()} 超出范围 {model.user_embedding.num_embeddings}")
+                        continue
+                    if hist_item_seq.max() >= model.item_embedding.num_embeddings:
+                        print(f"警告：物品ID {hist_item_seq.max()} 超出范围 {model.item_embedding.num_embeddings}")
+                        continue
+                    
+                    # 6. 移动数据到设备
+                    user_id = user_id.to(device)
+                    hist_item_seq = hist_item_seq.to(device)
+                    target_item = target_item.to(device)
+                    seq_len = seq_len.to(device)
+                    label = label.to(device)
+                    
+                    # 7. 使用混合精度训练
+                    with torch.cuda.amp.autocast():
+                        scores = model(user_id, hist_item_seq, target_item, seq_len)
+                        loss = criterion(scores, label)
+                    
                     optimizer.zero_grad()
-                    loss.backward()
-                    optimizer.step()
+                    scaler.scale(loss).backward()
+                    scaler.step(optimizer)
+                    scaler.update()
                     
                     train_loss += loss.item()
                     train_batches += 1
                     
-                    # 每100个批次打印一次当前训练状态
                     if (batch_idx + 1) % 100 == 0:
-                        print(f"  Batch {batch_idx+1}/{len(train_dataloader)}, Loss: {loss.item():.4f}")
+                        avg_train_loss = train_loss / (train_batches + 1)
+                        print(f"  Batch {batch_idx+1}/{len(train_dataloader)}, "
+                              f"Loss: {loss.item():.4f}, "
+                              f"Avg Loss: {avg_train_loss:.4f}")
                         
-                except Exception as e:
-                    print(f"[train_youtube_dnn] 处理批次 {batch_idx} 时出错: {str(e)}")
-                    print(f"批次信息: user_id shape={batch['user_id'].shape}, "
-                          f"hist_item_seq shape={batch['hist_item_seq'].shape}, "
-                          f"target_item shape={batch['target_item'].shape}, "
-                          f"seq_len shape={batch['seq_len'].shape}, "
-                          f"label shape={batch['label'].shape}")
+                except RuntimeError as e:
+                    print(f"训练批次 {batch_idx} 出错: {str(e)}")
+                    torch.cuda.empty_cache()
                     continue
             
-            # 评估模型
+            # 计算平均训练损失
+            avg_train_loss = train_loss / max(1, train_batches)
+            
+            # 验证阶段
+            print(f"\n开始第 {epoch+1} 轮验证...")
             model.eval()
             val_loss = 0.0
             val_batches = 0
             
             with torch.no_grad():
-                for batch in test_dataloader:
+                for batch_idx, batch in enumerate(tqdm(test_dataloader, desc="验证")):
                     try:
-                        user_id = batch['user_id'].to(device)
-                        hist_item_seq = batch['hist_item_seq'].to(device)
-                        target_item = batch['target_item'].to(device)
-                        seq_len = batch['seq_len'].to(device)
+                        # 在当前设备上进行验证
+                        user_id = batch['user_id'].long().to(device)
+                        hist_item_seq = batch['hist_item_seq'].long().to(device)
+                        target_item = batch['target_item'].long().to(device)
+                        seq_len = batch['seq_len'].long().to(device)
                         label = batch['label'].float().to(device)
                         
                         scores = model(user_id, hist_item_seq, target_item, seq_len)
@@ -256,23 +321,37 @@ def train_youtube_dnn(train_dataloader, test_dataloader, model, device, epochs=5
                         
                         val_loss += loss.item()
                         val_batches += 1
+                        
+                        if (batch_idx + 1) % 100 == 0:
+                            print(f"  验证批次 {batch_idx+1}/{len(test_dataloader)}, "
+                                  f"Loss: {loss.item():.4f}")
+                            
                     except Exception as e:
-                        print(f"[train_youtube_dnn] 验证时出错: {str(e)}")
+                        print(f"验证批次 {batch_idx} 出错: {str(e)}")
                         continue
             
-            model.train()
-            
-            # 打印每个epoch的训练和验证损失
-            avg_train_loss = train_loss / max(1, train_batches)
+            # 计算平均验证损失
             avg_val_loss = val_loss / max(1, val_batches)
-            print(f'Epoch {epoch+1}/{epochs}, Train Loss: {avg_train_loss:.4f}, '
+            
+            print(f'Epoch {epoch+1}/{epochs}, '
+                  f'Train Loss: {avg_train_loss:.4f}, '
                   f'Val Loss: {avg_val_loss:.4f}')
-    
+            
+            # 保存最佳模型
+            if avg_val_loss < best_val_loss:
+                best_val_loss = avg_val_loss
+                best_model_state = {k: v.cpu() for k, v in model.state_dict().items()}
+                print(f"发现更好的模型，验证损失: {best_val_loss:.4f}")
+        
+        # 恢复最佳模型状态
+        if best_model_state is not None:
+            model.load_state_dict(best_model_state)
+            print(f"已恢复最佳模型，验证损失: {best_val_loss:.4f}")
+        
     except Exception as e:
-        print(f"[train_youtube_dnn] 训练过程中发生错误: {str(e)}")
-        import traceback
-        traceback.print_exc()
-    
+        print(f"训练过程发生错误: {str(e)}")
+        raise  # 抛出异常以便查看完整的错误堆栈
+        
     print("[train_youtube_dnn] 训练完成!")
     return model
 
@@ -282,42 +361,116 @@ def youtubednn_u2i_dict(data, save_path="./cache/", topk=20, epochs=5, batch_siz
     model_cache = os.path.join(save_path, 'youtube_model.pth')
     embeddings_cache = os.path.join(save_path, 'youtube_embeddings.pkl')
     cache_path = os.path.join(save_path, 'youtube_u2i_dict.pkl')
+    dataset_cache = os.path.join(save_path, 'youtube_dataset.pkl')
     
     print("[youtubednn_u2i_dict] 🚀 开始YouTubeDNN处理...")
     
-    # 获取用户和物品的编码
+    # 确保缓存目录存在
+    os.makedirs(save_path, exist_ok=True)
+    
+    # 1. 修改ID编码部分
+    print("[youtubednn_u2i_dict] 开始ID编码...")
     user_encoder = LabelEncoder()
     item_encoder = LabelEncoder()
     
-    # 重新编码用户和物品ID，确保ID从0开始连续
+    # 获取所有可能的物品ID
+    all_item_ids = data['click_article_id'].unique()
+    max_item_id = max(all_item_ids)
+    print(f"[youtubednn_u2i_dict] 原始物品ID范围: 0-{max_item_id}")
+    
+    # 确保ID从0开始连续
     data['user_id_encoded'] = user_encoder.fit_transform(data['user_id'])
     data['click_article_id_encoded'] = item_encoder.fit_transform(data['click_article_id'])
     
-    # 获取编码后的用户和物品数量
-    user_count = len(user_encoder.classes_)
-    item_count = len(item_encoder.classes_)
+    # 获取编码后的用户和物品数量，并添加一些余量
+    user_count = len(user_encoder.classes_) + 1  # +1 for padding
+    item_count = len(item_encoder.classes_) + 1  # +1 for padding
     
+    # 验证编码结果
+    max_encoded_item = data['click_article_id_encoded'].max()
     print(f"[youtubednn_u2i_dict] 编码后 - 用户数量: {user_count}, 物品数量: {item_count}")
+    print(f"[youtubednn_u2i_dict] 编码后物品ID最大值: {max_encoded_item}")
     
-    # 创建模型实例 - 使用编码后的数量
+    # 创建ID映射字典以便调试
+    id_mapping = dict(zip(item_encoder.classes_, item_encoder.transform(item_encoder.classes_)))
+    
+    # 验证所有物品ID都在正确范围内
+    invalid_ids = data[data['click_article_id_encoded'] >= item_count]['click_article_id'].unique()
+    if len(invalid_ids) > 0:
+        print(f"[警告] 发现 {len(invalid_ids)} 个超出范围的物品ID")
+        print(f"样例: {invalid_ids[:5]}")
+        
+    # 创建模型实例 - 使用验证后的item_count
     model = YouTubeDNNModel(
         user_count, 
-        item_count, 
+        item_count,  # 确保这个数值足够大
         embedding_dim=embedding_dim,
         hidden_units=(128, 64, embedding_dim),
         dropout=0.3
     )
     
-    # 检查缓存
+    # 2. 检查是否存在预训练模型
     if os.path.exists(model_cache):
-        print(f"[youtubednn_u2i_dict] ✅ 发现模型缓存: {model_cache}")
-        try:
-            model.load_state_dict(torch.load(model_cache))
-            print("[youtubednn_u2i_dict] ✅ 模型加载成功")
-        except Exception as e:
-            print(f"[youtubednn_u2i_dict] ⚠️ 加载模型失败: {str(e)}")
-            print("[youtubednn_u2i_dict] 将重新训练模型")
-            # ... 训练模型的代码 ...
+        print(f"[youtubednn_u2i_dict] ✅ 加载预训练模型：{model_cache}")
+        model.load_state_dict(torch.load(model_cache))
+    else:
+        # 如果没有预训练模型，进行训练
+        train_set, test_set = gen_data_set(
+            data,  # 这里传入的data已经包含了编码后的ID
+            negsample=4, 
+            max_hist_len=30,
+            cache_path=dataset_cache,
+            use_cache=True
+        )
+        
+        # 3. 创建数据集时使用编码后的ID
+        train_dataset = YouTubeDNNDataset(
+            user_ids=[x[0] for x in train_set],  # 这里已经是编码后的user_id
+            item_seqs=[x[1] for x in train_set],  # 这里是编码后的item序列
+            target_items=[x[2] for x in train_set],  # 这里是编码后的target_item
+            labels=[x[3] for x in train_set],
+            seq_lens=[x[4] for x in train_set]
+        )
+        
+        test_dataset = YouTubeDNNDataset(
+            user_ids=[x[0] for x in test_set],
+            item_seqs=[x[1] for x in test_set],
+            target_items=[x[2] for x in test_set],
+            labels=[x[3] for x in test_set],
+            seq_lens=[x[4] for x in test_set]
+        )
+        
+        # 创建数据加载器
+        train_dataloader = DataLoader(
+            train_dataset,
+            batch_size=batch_size,
+            shuffle=True,
+            num_workers=4
+        )
+        
+        test_dataloader = DataLoader(
+            test_dataset,
+            batch_size=batch_size,
+            shuffle=False,
+            num_workers=4
+        )
+        
+        # 设置设备
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        
+        # 训练模型
+        model = train_youtube_dnn(
+            train_dataloader=train_dataloader,
+            test_dataloader=test_dataloader,
+            model=model,
+            device=device,
+            epochs=epochs,
+            learning_rate=0.001,
+            weight_decay=1e-6
+        )
+        
+        # 保存训练好的模型
+        torch.save(model.state_dict(), model_cache)
     
     # 初始化嵌入变量
     user_embeddings = {}
@@ -331,10 +484,17 @@ def youtubednn_u2i_dict(data, save_path="./cache/", topk=20, epochs=5, batch_siz
             item_embeddings = cache_data['item_embeddings']
     else:
         print("[youtubednn_u2i_dict] ⚠️ 未找到嵌入缓存，将重新计算嵌入")
+        # 设置设备
+        device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        print(f"[youtubednn_u2i_dict] 使用设备: {device}")
+
+        # 将模型移到正确的设备上
+        model = model.to(device)
         model.eval()
+
         with torch.no_grad():
             # 为所有物品计算嵌入
-            encoded_items = torch.LongTensor(range(item_count))  # 使用编码后的ID
+            encoded_items = torch.LongTensor(range(item_count)).to(device)  # 移动到同一设备
             item_embs = model.get_item_embedding(encoded_items).detach().cpu().numpy()
             
             # 保存时使用原始ID
@@ -352,14 +512,14 @@ def youtubednn_u2i_dict(data, save_path="./cache/", topk=20, epochs=5, batch_siz
                 encoded_user_id = user_encoder.transform([user_id])[0]
                 hist_items = user_hist[-30:]  # 最多使用最近30个交互
                 hist_len = len(hist_items)
-                hist_tensor = torch.LongTensor(hist_items + [0] * (30 - hist_len))
+                hist_tensor = torch.LongTensor(hist_items + [0] * (30 - hist_len)).to(device)  # 移动到同一设备
                 hist_tensor = hist_tensor.unsqueeze(0)
-                user_tensor = torch.LongTensor([encoded_user_id])
-                seq_len = torch.LongTensor([hist_len])
+                user_tensor = torch.LongTensor([encoded_user_id]).to(device)  # 移动到同一设备
+                seq_len = torch.LongTensor([hist_len]).to(device)  # 移动到同一设备
                 
                 # 获取用户嵌入
                 try:
-                    user_emb = model.get_user_embedding(user_tensor, hist_tensor, seq_len).numpy()
+                    user_emb = model.get_user_embedding(user_tensor, hist_tensor, seq_len).cpu().numpy()  # 先转到CPU
                     user_embeddings[user_id] = user_emb.squeeze() / np.linalg.norm(user_emb)
                 except Exception as e:
                     print(f"[youtubednn_u2i_dict] ⚠️ 处理用户 {user_id} 嵌入时出错: {str(e)}")
@@ -426,7 +586,9 @@ def youtubednn_u2i_dict(data, save_path="./cache/", topk=20, epochs=5, batch_siz
     
     return user_recall_items_dict 
 
-def get_youtube_recall(train_df, val_df, save_path, use_cache=True, epochs=2, batch_size=256, embedding_dim=16):
+def get_youtube_recall(train_df, val_df, save_path, use_cache=True, epochs=10, 
+                      batch_size=32,  # 减小batch_size
+                      embedding_dim=32):
     """
     使用PyTorch版本的YouTubeDNN模型生成用户-物品召回表
     
@@ -459,6 +621,21 @@ def get_youtube_recall(train_df, val_df, save_path, use_cache=True, epochs=2, ba
     
     print("[get_youtube_recall] 🚀 生成YouTubeDNN召回结果...")
     
+    # 确保所有ID都经过编码
+    item_encoder = LabelEncoder()
+    user_encoder = LabelEncoder()
+    
+    # 先对所有可能的ID进行fit
+    all_item_ids = pd.concat([train_df['click_article_id'], val_df['click_article_id']]).unique()
+    all_user_ids = pd.concat([train_df['user_id'], val_df['user_id']]).unique()
+    
+    item_encoder.fit(all_item_ids)
+    user_encoder.fit(all_user_ids)
+    
+    # 然后再transform
+    train_df['click_article_id_encoded'] = item_encoder.transform(train_df['click_article_id'])
+    val_df['click_article_id_encoded'] = item_encoder.transform(val_df['click_article_id'])
+    
     # 仅使用用户和物品ID，简化处理
     df = pd.concat([train_df, val_df], ignore_index=True)
     user_count = df['user_id'].nunique() + 1  # +1 避免索引越界
@@ -473,8 +650,14 @@ def get_youtube_recall(train_df, val_df, save_path, use_cache=True, epochs=2, ba
     for user_id, group in df.groupby('user_id'):
         user_hist_dict[user_id] = group.sort_values('click_timestamp')['click_article_id'].tolist()
     
-    # 创建模型
-    model = YouTubeDNNModel(user_count, item_count, embedding_dim=embedding_dim)
+    # 创建模型时使用较小的隐藏层
+    model = YouTubeDNNModel(
+        user_count, 
+        item_count, 
+        embedding_dim=embedding_dim,
+        hidden_units=(64, 32),  # 减小隐藏层
+        dropout=0.2
+    )
     
     # 检查模型缓存
     if use_cache and os.path.exists(model_path):
