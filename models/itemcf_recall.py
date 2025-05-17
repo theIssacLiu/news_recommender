@@ -5,7 +5,7 @@ from collections import defaultdict
 import pickle
 import os
 
-from utils import get_user_item_time
+from utils import get_user_item_time_dict
 
 def itemcf_sim(df, item_created_time_dict, save_path, use_cache=True):
     """
@@ -33,7 +33,7 @@ def itemcf_sim(df, item_created_time_dict, save_path, use_cache=True):
     # 否则重新计算
     print(f"[itemcf_sim] 重新计算相似度矩阵...")
 
-    user_item_time_dict = get_user_item_time(df)
+    user_item_time_dict = get_user_item_time_dict(df)
 
     # 计算物品相似度
     i2i_sim = {}

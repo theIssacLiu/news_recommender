@@ -8,7 +8,7 @@ import torch
 from datetime import datetime
 
 from utils import (
-    get_user_item_time,
+    get_user_item_time_dict,
     get_item_topk_click,
     get_item_info_dict
 )
@@ -284,7 +284,7 @@ def online_predict(use_cache=True, recall_num=50, epochs=10, batch_size=32, embe
     # Step 2: 准备相关数据
     item_info_df = get_item_info_df(data_path)
     item_type_dict, item_words_dict, item_created_time_dict = get_item_info_dict(item_info_df)
-    user_item_time_dict = get_user_item_time(train_df)
+    user_item_time_dict = get_user_item_time_dict(train_df)
     item_topk_click = get_item_topk_click(train_df, k=50)
     
     # Step 3: 加载并抽样 embedding，构建 embedding 相似度
@@ -331,7 +331,7 @@ def online_predict(use_cache=True, recall_num=50, epochs=10, batch_size=32, embe
     
     # 合并训练集和测试集来获取完整的用户-物品交互字典
     all_df = pd.concat([train_df, test_df], ignore_index=True)
-    all_user_item_time_dict = get_user_item_time(all_df)
+    all_user_item_time_dict = get_user_item_time_dict(all_df)
     
     # 使用合并后的数据计算物品相似度
     i2i_sim = itemcf_sim(
