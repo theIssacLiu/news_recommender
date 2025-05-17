@@ -44,7 +44,7 @@ def reduce_mem(df):
     return df
 
 # 根据点击时间获取用户的点击文章序列   {user1: {item1: time1, item2: time2..}...}
-def get_user_item_time(click_df):
+def get_user_item_time_dict(click_df):
     click_df = click_df.sort_values('click_timestamp')
 
     def make_item_time_pair(df):
@@ -58,8 +58,8 @@ def get_user_item_time(click_df):
     return user_item_time_dict
 
 
-# 根据时间获取商品被点击的用户序列  {item1: {user1: time1, user2: time2...}...}
-# 这里的时间是用户点击当前商品的时间，好像没有直接的关系。
+# 根据时间获取文章被点击的用户序列  {item1: {user1: time1, user2: time2...}...}
+# 这里的时间是用户点击当前文章的时间，好像没有直接的关系。
 def get_item_user_time_dict(click_df):
     def make_user_time_pair(df):
         return list(zip(df['user_id'], df['click_timestamp']))
@@ -83,6 +83,7 @@ def get_hist_and_last_click(all_click):
         if len(user_df) == 1:
             return user_df
         else:
+            #有超过一个点击，则返回除了最后一个点击的所有点击
             return user_df[:-1]
 
     click_hist_df = all_click.groupby('user_id').apply(hist_func).reset_index(drop=True)
@@ -92,9 +93,10 @@ def get_hist_and_last_click(all_click):
 
 # 获取文章id对应的基本属性，并保存成字典的形式，方便后面召回阶段，冷启动阶段直接使用
 def get_item_info_dict(item_info_df):
+    # 对时间做归一化
     max_min_scaler = lambda x: (x - np.min(x)) / (np.max(x) - np.min(x))
     item_info_df['created_at_ts'] = item_info_df[['created_at_ts']].apply(max_min_scaler)
-
+    # 将文章id作为key，其他属性作为value，保存成字典
     item_type_dict = dict(zip(item_info_df['click_article_id'], item_info_df['category_id']))
     item_words_dict = dict(zip(item_info_df['click_article_id'], item_info_df['words_count']))
     item_created_time_dict = dict(zip(item_info_df['click_article_id'], item_info_df['created_at_ts']))
@@ -102,6 +104,7 @@ def get_item_info_dict(item_info_df):
     return item_type_dict, item_words_dict, item_created_time_dict
 
 
+# 获取用户历史点击文章的类型、id、字数、创建时间
 def get_user_hist_item_info_dict(all_click):
     # 获取user_id对应的用户历史点击文章类型的集合字典
     user_hist_item_typs = all_click.groupby('user_id')['category_id'].agg(set).reset_index()

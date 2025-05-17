@@ -18,14 +18,12 @@ from models.usercf_recall import usercf_sim, generate_usercf_recall_dict, get_us
 from models.YouTubeDNN_torch import YouTubeDNNModel, youtubednn_u2i_dict
 from recall_evaluation import metrics_recall
 
-# 直接使用相对路径
+
 data_path = './data_raw/'
-cache_dir = './cache/offline_multi'  # 改为相对路径
+cache_dir = './cache/offline_multi' 
 
 # 确保缓存目录存在
 os.makedirs(cache_dir, exist_ok=True)
-
-print(f"缓存目录: {cache_dir}")
 
 def split_train_val(all_click_df):
     """
